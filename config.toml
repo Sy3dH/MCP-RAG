@@ -1,0 +1,26 @@
+[project]
+name = "researchSoup"
+description = "Your personal research companion"
+
+[UI]
+name = "🥣 researchSoup"
+description = "Clean, simple research assistant"
+default_collapse_content = true
+default_expand_messages = false
+hide_cot = false
+github = ""
+
+[theme]
+primary_color = "#3b82f6"
+background_color = "#ffffff"
+paper_color = "#ffffff"
+
+[theme.light]
+background = "#fafafa"
+paper = "#ffffff"
+primary = "#3b82f6"
+text_primary = "#1f2937"
+text_secondary = "#6b7280"
+
+[meta]
+generated_by = "0.7.0"
