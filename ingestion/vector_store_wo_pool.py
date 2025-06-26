@@ -31,24 +31,10 @@ class VectorStore:
         return self.author_user_map[author]
 
     def ingest(self, documents: List[DocumentModel], vectors: List[List[float]]):
-        inserted_docs = []
-        skipped_docs = []
         points = []
         doc_uuid = f"doc_{uuid.uuid4().hex[:8]}"
 
         for i, (doc, vector) in enumerate(zip(documents, vectors)):
-            search_hits = self.client.query_points(
-                collection_name=self.collection_name,
-                query=vector,
-                limit=1,
-                score_threshold=SIMILARITY_THRESHOLD,
-                with_payload=False
-            )
-
-            if search_hits.points:
-                skipped_docs.append(doc)
-                continue
-
             user_id = self._get_or_create_user_id(doc.researcher)
             payload = {
                 "text": doc.text,
@@ -63,28 +49,9 @@ class VectorStore:
 
             point = PointStruct(id=str(uuid.uuid4()), vector=vector, payload=payload)
             points.append(point)
-            inserted_docs.append(doc)
 
         if points:
-            self.client.upsert(collection_name=self.collection_name, points=points)
-
-        return inserted_docs, skipped_docs
-
-    # def ingest(self, documents: List[DocumentModel], vectors: List[List[float]]):
-    #     doc_uuid = f"doc_{uuid.uuid4().hex[:8]}"
-    #     points = []
-    #
-    #     for i, (doc, vector) in enumerate(zip(documents, vectors)):
-    #         user_id = self._get_or_create_user_id(doc.researcher)
-    #         payload = {
-    #             "text": doc.text,
-    #             "researcher": doc.researcher,
-    #             "user_id": user_id,
-    #             "document_id": doc_uuid,
-    #             "chunk_id": f"chunk_{i}",
-    #             "time": doc.time,
-    #             "findings": doc.findings,
-    #         }
-    #         points.append(PointStruct(id=str(uuid.uuid4()), vector=vector, payload=payload))
-    #
-    #     self.client.upsert(collection_name=self.collection_name, points=points)
+            try:
+                self.client.upsert(collection_name=self.collection_name, points=points)
+            except Exception as e:
+                raise RuntimeError(f"Failed to upsert points into collection '{self.collection_name}': {e}")
