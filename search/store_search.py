@@ -2,12 +2,12 @@ from typing import List, Optional
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 from qdrant_client import QdrantClient
 from configs.constants import vector_store_path
-from embeddings.vectorizer import FastEmbedder
 from configs.constants import SIMILARITY_THRESHOLD
 from qdrant_client.http.exceptions import UnexpectedResponse
 
-def vector_search_with_filter(query_vector: List[float], collection_name: str = "AI_store", limit: int = 5, keyword: Optional[str] = None):
-    client = QdrantClient(path = vector_store_path)
+def vector_search_with_filter(query_vector: List[float], collection_name: str = "AI_store", limit: int = 5,
+                              keyword: Optional[str] = None):
+    client = QdrantClient(path=vector_store_path)
     try:
         filters = None
         if keyword:
@@ -25,17 +25,30 @@ def vector_search_with_filter(query_vector: List[float], collection_name: str = 
         return results
 
     except UnexpectedResponse as e:
-       raise RuntimeError(f"Qdrant query failed: {str(e)}") from e
+        raise RuntimeError(f"Qdrant query failed: {str(e)}") from e
     except Exception as e:
-       raise RuntimeError("An unexpected error occurred during vector search.") from e
+        raise RuntimeError("An unexpected error occurred during vector search.") from e
 
 
-def vector_search_with_threshold(query_vector: List[float], collection_name: str = "AI_store"):
-        client = QdrantClient(path=vector_store_path)
+def is_vector_similar(query_vector: List[float], collection_name: str = "AI_store") -> bool:
+    client = QdrantClient(path=vector_store_path)
 
-        results = client.query_points(
-            collection_name=collection_name,
-            query=query_vector,
-            score_threshold=SIMILARITY_THRESHOLD,
-        )
-        return results
+    try:
+        client.get_collection(collection_name=collection_name)
+    except ValueError:
+        return False
+
+    results = client.query_points(
+        collection_name=collection_name,
+        query=query_vector,
+        score_threshold=SIMILARITY_THRESHOLD,
+        limit=1,
+        with_payload=False
+    )
+    return bool(results.points)
+
+
+def list_vector_stores() -> list:
+    client = QdrantClient(path=vector_store_path)
+    collections_info = client.get_collections()
+    return [collection.name for collection in collections_info.collections]
