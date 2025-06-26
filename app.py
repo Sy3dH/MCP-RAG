@@ -2,11 +2,22 @@ import streamlit as st
 import requests
 import pandas as pd
 from urllib.parse import quote
+import os
 
-# Page config (use full width)
+@st.cache_data(show_spinner=False)
+def get_vector_stores():
+    try:
+        response = requests.get("http://localhost:8001/retrieve_vector_stores")
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as e:
+        st.error(f"Error fetching vector stores: {e}")
+        return []
+
+# Page config
 st.set_page_config(page_title="researchSoup", layout="wide", page_icon="🥣")
 
-# Custom CSS to remove container padding
+# Custom CSS
 st.markdown(
     "<style>"
     ".stApp {max-width: 100% !important; padding: 0 1rem;}"
@@ -25,46 +36,45 @@ st.markdown(
 # Initialize session state
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "docs_table" not in st.session_state:
-    st.session_state.docs_table = []
-if "pdf_paths" not in st.session_state:
-    st.session_state.pdf_paths = []
 if "new_prompt" not in st.session_state:
     st.session_state.new_prompt = ''
 
-# Tabs: Chat & Ingest
+# Tabs
 tab_chat, tab_ingest = st.tabs(["🍽️ Chat", "📚 Ingest Documents"])
 
 with tab_chat:
-    # Display chat history
-    for msg in st.session_state.messages:
+    for idx, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg['role']):
             st.markdown(msg['content'], unsafe_allow_html=True)
 
-    # Documents expander
-    if st.session_state.docs_table:
-        with st.expander("📄 Retrieved Documents", expanded=True):
-            st.dataframe(pd.DataFrame(st.session_state.docs_table), use_container_width=True)
-            if st.session_state.pdf_paths:
-                st.markdown("**Downloadable PDFs:**")
-                cols = st.columns(min(3, len(st.session_state.pdf_paths)))
-                for i, path in enumerate(st.session_state.pdf_paths):
-                    label = f"Document #{i+1:02d}"
-                    url = f"http://localhost:8001/download?file_path={quote(path)}"
-                    with cols[i % 3]:
-                        try:
-                            data = requests.get(url, timeout=10).content
-                            st.download_button(
-                                label=label,
-                                data=data,
-                                file_name=path.rsplit('/',1)[-1],
-                                mime="application/pdf",
-                                key=f"dl_{i}"
-                            )
-                        except:
-                            st.markdown(f"[{label}]({url})")
+            if msg['role'] == 'assistant':
+                if 'docs_table' in msg and msg['docs_table']:
+                    with st.expander("Reference Documents", expanded=False):
+                        st.dataframe(pd.DataFrame(msg['docs_table']), use_container_width=True)
 
-    # Chat Input fixed at bottom: wide columns
+                        if 'pdf_paths' in msg and msg['pdf_paths']:
+                            st.markdown("**Downloadable PDFs:**")
+                            cols = st.columns(min(3, len(msg['pdf_paths'])))
+                            for i, path in enumerate(msg['pdf_paths']):
+                                label = os.path.basename(path).split('_', 1)[-1]
+                                url = f"http://localhost:8001/download?file_path={quote(path)}"
+                                with cols[i % 3]:
+                                    try:
+                                        data = requests.get(url, timeout=10).content
+                                        st.download_button(
+                                            label=label,
+                                            data=data,
+                                            file_name=path.rsplit('/', 1)[-1],
+                                            mime="application/pdf",
+                                            key=f"dl_{idx}_{i}"
+                                        )
+                                    except:
+                                        st.markdown(f"[{label}]({url})")
+
+                elif 'search_results' in msg and msg['search_results']:
+                    with st.expander("🔍 Web Search Results", expanded=False):
+                        st.dataframe(pd.DataFrame(msg['search_results']), use_container_width=True)
+
     input_col, send_col = st.columns([10, 1])
     st.session_state.new_prompt = input_col.text_input(
         "",
@@ -79,7 +89,7 @@ with tab_chat:
 
     if send and st.session_state.new_prompt.strip():
         prompt = st.session_state.new_prompt.strip()
-        st.session_state.messages.append({'role':'user','content':prompt})
+        st.session_state.messages.append({'role': 'user', 'content': prompt})
         try:
             r = requests.post(
                 "http://localhost:8002/chat",
@@ -89,77 +99,161 @@ with tab_chat:
             r.raise_for_status()
             resp = r.json().get('response', {})
             answer = resp.get('response', 'No answer.')
-            st.session_state.messages.append({'role':'assistant','content':f"**Answer:**\n{answer}"})
 
-            # Process documents
-            raw = resp.get('documents', {}).get('results', [])
-            docs = []
-            if isinstance(raw, list) and raw:
-                if isinstance(raw[0], list) and len(raw[0]) > 1:
-                    docs = raw[0][1]
-                elif isinstance(raw[0], dict):
-                    docs = raw
+            assistant_msg = {
+                'role': 'assistant',
+                'content': f"{answer}"
+            }
 
-            table, pdfs, seen = [], [], set()
-            for idx, d in enumerate(docs, 1):
-                text = d.get('payload', {}).get('text', '')
-                preview = text[:200] + ('...' if len(text) > 200 else '')
-                table.append({'Doc #': idx, 'Score': round(d.get('score', 0), 3), 'Preview': preview})
-                path = d.get('payload', {}).get('pdf_path')
-                if path and path not in seen:
-                    pdfs.append(path)
-                    seen.add(path)
+            tool_calls = resp.get("tool_calls", [])
+            documents_data = resp.get('documents', {})
 
-            st.session_state.docs_table = table
-            st.session_state.pdf_paths = pdfs
+            if tool_calls and tool_calls[0].get("tool_name") == "search_web":
+                docs = documents_data.get("results", [])
+                if docs:
+                    web_results = []
+                    for item in docs:
+                        web_results.append({
+                            "Title": item.get("title", "Untitled"),
+                            "URL": item.get("url", "")
+                        })
+                    assistant_msg['search_results'] = web_results
+            else:
+                # Normal retrieved documents flow
+                raw = documents_data.get('results', []) if documents_data else []
+
+                docs = []
+                if isinstance(raw, list) and raw:
+                    if isinstance(raw[0], list) and len(raw[0]) > 1:
+                        docs = raw[0][1]
+                    elif isinstance(raw[0], dict):
+                        docs = raw
+
+                if docs:
+                    table, pdfs, seen = [], [], set()
+
+                    for idx, d in enumerate(docs, 1):
+                        text = d.get('payload', {}).get('text', '') if d.get('payload') else ''
+                        preview = text[:200] + ('...' if len(text) > 200 else '')
+                        table.append({'Doc #': idx, 'Score': round(d.get('score', 0), 3), 'Preview': preview})
+
+                        path = d.get('payload', {}).get('pdf_path')
+                        if path and path not in seen:
+                            pdfs.append(path)
+                            seen.add(path)
+
+                    assistant_msg['docs_table'] = table
+                    assistant_msg['pdf_paths'] = pdfs
+
+            st.session_state.messages.append(assistant_msg)
+
         except Exception as e:
-            st.session_state.messages.append({'role':'assistant','content':f"⚠️ {e}"})
-        # Clear input and rerun
+            st.session_state.messages.append({'role': 'assistant', 'content': f"⚠️ {e}"})
+
         st.session_state.new_prompt = ''
         st.rerun()
 
 with tab_ingest:
     st.markdown("### 📥 Upload Research Documents")
     st.markdown("Add new documents to your research collection")
-    with st.form("ingest_form", clear_on_submit=True):
-        researcher = st.text_input("Researcher Name")
-        collection = st.text_input("Collection Name", value="AI_store")
-        findings = st.text_area("Research Findings")
-        model = st.selectbox(
-            "Embedding Model (Optional)",
-            ["Default", "BAAI/bge-small-en-v1.5", "sentence-transformers/all-MiniLM-L6-v2"]
+
+    with st.form("document_ingestion", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            researcher = st.text_input(
+                "Researcher Name",
+                placeholder="Enter researcher name...",
+                help="Name of the researcher or author"
+            )
+
+        with col2:
+            vector_store_options = get_vector_stores()
+            collection_name = st.selectbox(
+                "Collection Name",
+                options=vector_store_options or ["AI_store"],
+                index=0,
+                help="Select the document collection"
+            )
+
+        findings = st.text_area(
+            "Research Findings",
+            placeholder="Summarize key findings or context...",
+            height=100,
+            help="Brief summary of the research findings or document content"
         )
-        files = st.file_uploader("Upload PDFs", type='pdf', accept_multiple_files=True)
-        if st.form_submit_button("🚀 Ingest Documents"):
-            if not (researcher and findings and files):
-                st.error("Fill in all fields and upload at least one PDF.")
+
+        embedding_model = st.selectbox(
+            "Embedding Model (Optional)",
+            options=["Default", "BAAI/bge-small-en-v1.5", "sentence-transformers/all-MiniLM-L6-v2"],
+            index=0,
+            help="Choose embedding model for document processing"
+        )
+
+        uploaded_files = st.file_uploader(
+            "Upload PDF Documents",
+            type=['pdf'],
+            accept_multiple_files=True,
+            help="Select one or more PDF files to upload"
+        )
+
+        submitted = st.form_submit_button("🚀 Ingest Documents", type="primary")
+
+        if submitted:
+            if not researcher.strip():
+                st.error("Please enter a researcher name")
+            elif not findings.strip():
+                st.error("Please enter research findings")
+            elif not uploaded_files:
+                st.error("Please upload at least one PDF file")
             else:
-                payload = {'researcher': researcher, 'findings': findings, 'collection_name': collection}
-                if model != "Default":
-                    payload['embedding_model'] = model
-                files_payload = [('pdfs', (f.name, f.getvalue(), 'application/pdf')) for f in files]
-                with st.spinner("Ingesting documents...⏳"):
+                files = [('pdfs', (f.name, f.getvalue(), 'application/pdf')) for f in uploaded_files]
+
+                form_data = {
+                    'researcher': researcher,
+                    'findings': findings,
+                    'collection_name': collection_name,
+                }
+
+                if embedding_model != "Default":
+                    form_data['embedding_model'] = embedding_model
+
+                with st.spinner("Ingesting documents... This may take a while ⏳"):
                     try:
-                        r = requests.post(
+                        response = requests.post(
                             "http://localhost:8001/ingest_documents",
-                            data=payload,
-                            files=files_payload,
-                            timeout=60
+                            data=form_data,
+                            files=files
                         )
-                        r.raise_for_status()
-                        res = r.json()
-                        ins, sk = res.get('inserted_docs', []), res.get('skipped_docs', [])
-                        st.success(f"Processed: {len(ins)} inserted, {len(sk)} skipped.")
-                        def show_list(t, docs):
-                            if not docs: return ""
-                            items = "".join(
-                                f"<li>{doc.get('text','')[:100]}...</li>" for doc in docs
-                            )
-                            return f"<details><summary>{t} ({len(docs)})</summary><ul>{items}</ul></details>"
-                        st.markdown(show_list("Inserted", ins), unsafe_allow_html=True)
-                        st.markdown(show_list("Skipped", sk), unsafe_allow_html=True)
+                        response.raise_for_status()
+                        result = response.json()
+
+                        inserted_docs = result.get("inserted_documents", [])
+                        skipped_docs = result.get("skipped_documents", [])
+
+                        st.success("✅ Documents successfully processed!")
+                        st.info(f"📁 Added {len(inserted_docs)} new chunk(s) to collection '{collection_name}'")
+                        st.info(f"🔍 Skipped {len(skipped_docs)} due to similarity detection")
+
+                        def format_doc_list(title, docs):
+                            html = f"<details><summary>📄 {title} ({len(docs)})</summary><ul>"
+                            for i, doc in enumerate(docs):
+                                preview = doc.get("text", "No text available")[:300]
+                                if len(doc.get("text", "")) > 300:
+                                    preview += "..."
+                                html += f"<li><strong>Document #{i+1}</strong><br><span style='font-size: 0.85em;'>{preview}</span></li><br>"
+                            html += "</ul></details>"
+                            return html
+
+                        st.markdown(format_doc_list("Inserted Documents", inserted_docs), unsafe_allow_html=True)
+                        st.markdown(format_doc_list("Skipped Documents", skipped_docs), unsafe_allow_html=True)
+
+                    except requests.exceptions.Timeout:
+                        st.error("⏰ Request timed out. The documents might still be processing.")
+                    except requests.exceptions.RequestException as e:
+                        st.error(f"❌ Error ingesting documents: {e}")
                     except Exception as e:
-                        st.error(f"❌ {e}")
+                        st.error(f"❌ Unexpected error: {e}")
 
 # Footer
 st.markdown(
