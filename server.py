@@ -11,13 +11,18 @@ from parsers.pdf_parser import parse_pdf_chunks
 from utils.input_handler import prepare_documents
 from embeddings.vectorizer import FastEmbedder
 from ingestion.vector_store_wo_pool import VectorStore
-from search.store_search import vector_search_with_filter
+from search.store_search import vector_search_with_filter, is_vector_similar, list_vector_stores
+from configs.constants import UPLOAD_DIR
 from fastapi.responses import JSONResponse
 from models.models import Document
 from qdrant_client.http.exceptions import UnexpectedResponse
+import requests
 import io
+from dotenv import load_dotenv
 
-UPLOAD_DIR = r"D:\9D Tech Work\Central_repo\Demo\uploads"
+load_dotenv()
+BRAVE_SEARCH_API = os.getenv("BRAVE_SEARCH_API")
+
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # Set up logging
@@ -35,7 +40,7 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("Shutting down FastAPI app lifespan...")
 
-app = FastAPI(title="MCP Server for ResearchSoup", lifespan=lifespan)
+app = FastAPI(title="MCP Server for ResearchSoup", lifespan=lifespan, swagger_ui_parameters={"operationsSorter": "method"})
 
 @app.post("/ingest_documents")
 async def ingest_documents(
@@ -78,13 +83,19 @@ async def ingest_documents(
         docs = prepare_documents(researcher, findings, all_docs)
         vectors = embedder.embed([doc.text for doc in all_docs])
 
+        insertable_docs = []
+        insertable_vectors = []
+        skipped_docs = []
 
-        store = VectorStore(collection_name=collection_name, vector_size=vector_size)
-        store.init_collection()
-        inserted_docs, skipped_docs = store.ingest(docs, vectors)
+        for doc, vector in zip(docs, vectors):
+            if is_vector_similar(vector, collection_name):
+                skipped_docs.append(doc)
+            else:
+                insertable_docs.append(doc)
+                insertable_vectors.append(vector)
 
-
-        used_pdf_indices = set(doc_sources[docs.index(doc)] for doc in inserted_docs)
+        used_pdf_indices = set(doc_sources[docs.index(doc)] for doc in insertable_docs)
+        print(used_pdf_indices)
         saved_paths = []
 
         for i in used_pdf_indices:
@@ -95,11 +106,16 @@ async def ingest_documents(
             logger.info(f"Saved uploaded file: {file_path}")
             saved_paths.append(file_path)
 
+        store = VectorStore(collection_name=collection_name, vector_size=vector_size)
+        store.init_collection()
+
+        store.ingest(insertable_docs, insertable_vectors)
+
         return {
-            "message": f"Ingested {len(inserted_docs)} chunks into collection '{collection_name}' successfully.",
-            "docs_ingested": len(inserted_docs),
+            "message": f"Ingested {len(insertable_docs)} chunks into collection '{collection_name}' successfully.",
+            "docs_ingested": len(insertable_docs),
             "docs_skipped": len(skipped_docs),
-            "inserted_documents": inserted_docs,
+            "inserted_documents": insertable_docs,
             "skipped_documents": skipped_docs,
             "saved_files": saved_paths
         }
@@ -139,6 +155,7 @@ async def retrieve_documents(
         query_vector = embedder.embed([query_text])[0]
         results = vector_search_with_filter(
             query_vector=query_vector,
+
             collection_name=collection_name,
             limit=limit
         )
@@ -151,7 +168,53 @@ async def retrieve_documents(
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Unexpected error: {str(e)}"})
 
+@app.post("/search_web", operation_id="search_web")
+async def search_web(query: str):
+    try:
+        response = requests.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+                "x-subscription-token": BRAVE_SEARCH_API
+            },
+            params={
+                "q": query
+            },
+        )
+
+        if response.status_code != 200:
+            raise HTTPException(status_code=response.status_code, detail="Brave API Error")
+
+        json_data = response.json()
+
+        # Extract the top N results
+        web_results = json_data.get("web", {}).get("results", [])
+
+        # Clean results: title, url, description
+        results = [
+            {
+                "title": item.get("title"),
+                "url": item.get("url"),
+                "description": item.get("description")
+            }
+            for item in web_results
+        ]
+
+        return {"results": results}
+
+    except requests.exceptions.RequestException as e:
+        return JSONResponse(status_code=500, content={"error": f"Request failed: {str(e)}"})
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"Unexpected error: {str(e)}"})
+
+@app.get("/retrieve_vector_stores", operation_id="retrieve_vector_stores")
+async def retrieve_vector_stores():
+    return list_vector_stores()
+
+
 if __name__ == "__main__":
-    mcp = FastApiMCP(app,include_operations=["retrieve_documents"])
+    mcp = FastApiMCP(app,include_operations=["retrieve_documents", "retrieve_vector_stores", "search_web"])
     mcp.mount()
     uvicorn.run(app, host="0.0.0.0", port=8001)
