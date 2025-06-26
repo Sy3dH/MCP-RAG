@@ -5,7 +5,7 @@ from google.genai import types
 from dotenv import load_dotenv
 from mcp import ClientSession
 from mcp.client.sse import sse_client
-from configs.constants import SYSTEM_PROMPT
+from personality.prompt import SYSTEM_PROMPT
 import json
 import os
 
@@ -122,37 +122,24 @@ class MCPClient:
     async def process_chat_query(self, query: str, conversation_history: list = None) -> dict:
         """
         Process a chat query with maintained conversation history and optional tool invocation.
-
-        Args:
-            query: The user's query
-            conversation_history: List of previous conversation content
-
-        Returns:
-            dict: Contains response text, tool calls made, and updated conversation history
         """
-
-        # Initialize conversation history if not provided
         if conversation_history is None:
             conversation_history = []
 
         # List available tools from MCP
         tool_response = await self.session.list_tools()
-        tool_declarations = []
-
-        for tool in tool_response.tools:
-            tool_declarations.append({
+        tool_declarations = [
+            {
                 "name": tool.name,
                 "description": tool.description,
                 "parameters": tool.inputSchema,
-            })
+            }
+            for tool in tool_response.tools
+        ]
 
-        # Configure tools if available
-        config = None
-        if tool_declarations:
-            tools = types.Tool(function_declarations=tool_declarations)
-            config = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT,tools=[tools])
-        else:
-            config = types.GenerateContentConfig()
+        # Configure tools
+        config = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, tools=[types.Tool(
+            function_declarations=tool_declarations)]) if tool_declarations else types.GenerateContentConfig()
 
         # Build conversation contents
         contents = conversation_history.copy()
@@ -160,6 +147,7 @@ class MCPClient:
             role="user",
             parts=[types.Part(text=query)]
         ))
+
         # Generate initial response
         response = self.genai_client.models.generate_content(
             model="gemini-2.0-flash",
@@ -167,43 +155,78 @@ class MCPClient:
             contents=contents,
         )
 
-        # Process response - handle multiple parts
         tool_calls_made = []
         final_text = []
         result = []
+
         for part in response.candidates[0].content.parts:
-            # Check if this part is a tool call
             if hasattr(part, "function_call") and part.function_call:
                 tool_call = part.function_call
                 tool_name = tool_call.name
                 tool_args = dict(tool_call.args)
 
                 try:
-                    # Call MCP tool
+                    # First tool call
                     result = await self.session.call_tool(tool_name, tool_args)
-                    tool_calls_made.append({
-                        "tool_name": tool_name,
-                        "args": tool_args,
-                        "result": result.content
-                    })
+                    tool_result_data = result.content
+                    tool_data = json.loads(tool_result_data[0].text) if isinstance(tool_result_data,
+                                                                                   list) else json.loads(
+                        tool_result_data)
 
-                    # Add model's tool call to conversation
-                    contents.append(types.Content(
-                        role="model",
-                        parts=[types.Part(function_call=tool_call)]
-                    ))
+                    # Check for fallback if tool is retrieve_documents
+                    fallback_needed = False
+                    if tool_name == "retrieve_documents":
+                        try:
+                            top_score = tool_data["results"][0][1][0]["score"]
+                            fallback_needed = top_score < 0.7
+                        except (KeyError, IndexError, TypeError):
+                            fallback_needed = True
 
-                    # Add tool response to conversation
-                    contents.append(types.Content(
-                        role="user",
-                        parts=[types.Part.from_function_response(
+                    if fallback_needed:
+                        # Fallback to web_search
+                        fallback_tool_name = "web_search"
+                        fallback_args = {"query": query}
+                        fallback_result = await self.session.call_tool(fallback_tool_name, fallback_args)
+
+                        tool_calls_made.extend([
+                            {
+                                "tool_name": tool_name,
+                                "args": tool_args,
+                                "result": tool_result_data
+                            },
+                            {
+                                "tool_name": fallback_tool_name,
+                                "args": fallback_args,
+                                "result": fallback_result.content
+                            }
+                        ])
+
+                        contents.append(types.Content(role="model", parts=[types.Part(function_call=tool_call)]))
+                        contents.append(types.Content(role="user", parts=[types.Part.from_function_response(
                             name=tool_name,
-                            response={"result": result.content}
-                        )]
-                    ))
+                            response={"result": tool_result_data}
+                        )]))
+                        contents.append(types.Content(role="model", parts=[
+                            types.Part(function_call=types.FunctionCall(name=fallback_tool_name, args=fallback_args))]))
+                        contents.append(types.Content(role="user", parts=[types.Part.from_function_response(
+                            name=fallback_tool_name,
+                            response={"result": fallback_result.content}
+                        )]))
+
+                    else:
+                        tool_calls_made.append({
+                            "tool_name": tool_name,
+                            "args": tool_args,
+                            "result": tool_result_data
+                        })
+
+                        contents.append(types.Content(role="model", parts=[types.Part(function_call=tool_call)]))
+                        contents.append(types.Content(role="user", parts=[types.Part.from_function_response(
+                            name=tool_name,
+                            response={"result": tool_result_data}
+                        )]))
 
                 except Exception as e:
-                    # Handle tool call failures gracefully
                     error_msg = f"Error calling tool {tool_name}: {str(e)}"
                     tool_calls_made.append({
                         "tool_name": tool_name,
@@ -211,17 +234,12 @@ class MCPClient:
                         "error": str(e)
                     })
 
-                    # Add error response to conversation
-                    contents.append(types.Content(
-                        role="user",
-                        parts=[types.Part(text=error_msg)]
-                    ))
+                    contents.append(types.Content(role="user", parts=[types.Part(text=error_msg)]))
 
             elif hasattr(part, "text") and part.text:
-                # Regular text response
                 final_text.append(part.text)
 
-        # If tools were called, get the final response
+        # If any tool calls were made, follow up with additional model response
         if tool_calls_made:
             try:
                 followup = self.genai_client.models.generate_content(
@@ -236,28 +254,17 @@ class MCPClient:
                         final_response += part.text
 
                 final_text.append(final_response)
-
-                # Add final response to conversation history
-                contents.append(types.Content(
-                    role="model",
-                    parts=[types.Part(text=final_response)]
-                ))
+                contents.append(types.Content(role="model", parts=[types.Part(text=final_response)]))
 
             except Exception as e:
                 error_msg = "I encountered an issue processing the tool results. Please try again."
                 final_text.append(error_msg)
-
-                contents.append(types.Content(
-                    role="model",
-                    parts=[types.Part(text=error_msg)]
-                ))
+                contents.append(types.Content(role="model", parts=[types.Part(text=error_msg)]))
         else:
-            # No tool calls - add the direct response to conversation history
+            # No tool call - just return generated text
             response_text = "\n".join(final_text)
-            contents.append(types.Content(
-                role="model",
-                parts=[types.Part(text=response_text)]
-            ))
+            contents.append(types.Content(role="model", parts=[types.Part(text=response_text)]))
+
         return {
             "documents": json.loads(result.content[0].text) if result else [],
             "response": "\n".join(final_text),
